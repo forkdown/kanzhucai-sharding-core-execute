@@ -46,11 +46,25 @@ public final class TableMetaDataInitializer {
 
     private final TableMetaDataLoader tableMetaDataLoader;
 
+    //Here's a switch to open boosted startup mode;
+    //before function integrated into base project,
+    //you can rebuild org.apache.shardingsphere.core.execute module,
+    //change this to true ,then "mvn clean install" to use this function in your local environment.
+    private boolean startUpBoostedMode = true;
+
     public TableMetaDataInitializer(final ShardingDataSourceMetaData shardingDataSourceMetaData, final ShardingExecuteEngine executeEngine,
                                     final TableMetaDataConnectionManager connectionManager, final int maxConnectionsSizePerQuery, final boolean isCheckingMetaData) {
         this.shardingDataSourceMetaData = shardingDataSourceMetaData;
         this.connectionManager = connectionManager;
         tableMetaDataLoader = new TableMetaDataLoader(shardingDataSourceMetaData, executeEngine, connectionManager, maxConnectionsSizePerQuery, isCheckingMetaData);
+    }
+
+    public boolean isStartUpBoostedMode() {
+        return startUpBoostedMode;
+    }
+
+    public void setStartUpBoostedMode(boolean startUpBoostedMode) {
+        this.startUpBoostedMode = startUpBoostedMode;
     }
 
     /**
@@ -74,24 +88,85 @@ public final class TableMetaDataInitializer {
     @SneakyThrows
     public Map<String, TableMetaData> load(final ShardingRule shardingRule) {
         Map<String, TableMetaData> result = new HashMap<>();
+        if (startUpBoostedMode) {
+            System.out.println("org.apache.shardingsphere.core.execute.TableMetaDataInitializer:\n" +
+                    "    Beta function warn: Startup boosted mode is friendly for dev mode, " +
+                    "but it may cause database resources exhausted. \n" +
+                    "    Number of sqrt(number of all actual tables) threads created and finished in process. " +
+                    "if error occurs, change to stable mode. \n"+
+                    "    Or just use this in your local dev environment. ");
+        }
         result.putAll(loadShardingTables(shardingRule));
         result.putAll(loadDefaultTables(shardingRule));
         return result;
     }
 
     private Map<String, TableMetaData> loadShardingTables(final ShardingRule shardingRule) throws SQLException {
-        final ConcurrentHashMap<String, TableMetaData> result = new ConcurrentHashMap<>(shardingRule.getTableRules().size(), 1);
+
+        //get ready for tableNameList
+        Collection<TableRule> tableRules = shardingRule.getTableRules();
+        List<String> logicNameList = new ArrayList<>();
+        for (TableRule each : tableRules) {
+            logicNameList.add(each.getLogicTable());
+        }
+
+        if (startUpBoostedMode) {
+            return loadTablesInBoostedMode(logicNameList, shardingRule);
+        } else {
+            return loadTablesInStableMode(logicNameList, shardingRule);
+        }
+
+    }
+
+    private Map<String, TableMetaData> loadDefaultTables(final ShardingRule shardingRule) throws SQLException {
+        Map<String, TableMetaData> result = new ConcurrentHashMap<>(shardingRule.getTableRules().size(), 1);
+        Optional<String> actualDefaultDataSourceName = shardingRule.findActualDefaultDataSourceName();
+        if (actualDefaultDataSourceName.isPresent()) {
+
+            //get ready data
+            Collection<String> allTableNames = getAllTableNames(actualDefaultDataSourceName.get());
+            List<String> allTableNamesList = new ArrayList<>(allTableNames);
+
+            if (startUpBoostedMode) {
+                return loadTablesInBoostedMode(allTableNamesList, shardingRule);
+            } else {
+                return loadTablesInStableMode(allTableNamesList, shardingRule);
+            }
+
+        }
+        return result;
+    }
+
+    private Map<String, TableMetaData> loadTablesInBoostedMode(List<String> tableNameList, final ShardingRule shardingRule) throws SQLException {
 
         //Use multi threads to boost the start up .
+        final ConcurrentHashMap<String, TableMetaData> result = new ConcurrentHashMap<>(shardingRule.getTableRules().size(), 1);
+
+        //Slice the tableNameList to small parts.
+        Integer elementNumber = (int) Math.sqrt(tableNameList.size());
+        List<List<String>> parts = new ArrayList<>();
+        for (int i = 0, len = tableNameList.size(); i < len; i += elementNumber) {
+            if (i + elementNumber <= len) {
+                parts.add(tableNameList.subList(i, i + elementNumber));
+            } else {
+                parts.add(tableNameList.subList(i, len));
+            }
+        }
+
+        //process for every slices
         List<Thread> threadList = new ArrayList<>();
-        for (final TableRule each : shardingRule.getTableRules()) {
+        final List<SQLException> exceptionList = new ArrayList<>();
+
+        for (final List<String> eachPart : parts) {
             Thread thread = new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    try {
-                        result.put(each.getLogicTable(), tableMetaDataLoader.load(each.getLogicTable(), shardingRule));
-                    } catch (SQLException e) {
-                        e.printStackTrace();
+                    for (String each : eachPart) {
+                        try {
+                            result.put(each, tableMetaDataLoader.load(each, shardingRule));
+                        } catch (SQLException e) {
+                            exceptionList.add(e);
+                        }
                     }
                 }
             });
@@ -108,62 +183,21 @@ public final class TableMetaDataInitializer {
             }
         }
 
+        //throw SQLException
+        if (exceptionList.size() != 0) {
+            throw exceptionList.get(0);
+        }
+
         return result;
     }
 
-    private Map<String, TableMetaData> loadDefaultTables(final ShardingRule shardingRule) throws SQLException {
-        final ConcurrentHashMap<String, TableMetaData> result = new ConcurrentHashMap<>(shardingRule.getTableRules().size(), 1);
-        Optional<String> actualDefaultDataSourceName = shardingRule.findActualDefaultDataSourceName();
-        if (actualDefaultDataSourceName.isPresent()) {
+    private Map<String, TableMetaData> loadTablesInStableMode(List<String> tableNameList, ShardingRule shardingRule) throws SQLException {
+        final Map<String, TableMetaData> result = new ConcurrentHashMap<>(shardingRule.getTableRules().size(), 1);
 
-            //Use multi threads to boost the start up .
-            Collection<String> allTableNames = getAllTableNames(actualDefaultDataSourceName.get());
-            List<String> allTableNamesList = new ArrayList<>(allTableNames);
-            List<List<String>> parts = new ArrayList<>();
-
-            Integer elementNumber = 16;
-
-            for (int i = 0, len = allTableNamesList.size(); i < len; i += elementNumber) {
-                if (i + elementNumber <= len) {
-                    parts.add(allTableNamesList.subList(i, i + elementNumber));
-                } else {
-                    parts.add(allTableNamesList.subList(i, len));
-                }
-            }
-
-            for (List<String> eachPart : parts) {
-                System.out.println("part:");
-                for (String each : eachPart) {
-                    System.out.println("    " + each);
-                }
-            }
-
-
-            List<Thread> threadList = new ArrayList<>();
-            for (final String each : allTableNames) {
-                Thread thread = new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            result.put(each, tableMetaDataLoader.load(each, shardingRule));
-                        } catch (SQLException e) {
-                            e.printStackTrace();
-                        }
-                    }
-                });
-                thread.start();
-                threadList.add(thread);
-            }
-
-            //use 'join()' wait all thread finished.
-            for (Thread thread : threadList) {
-                try {
-                    thread.join();
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
-                }
-            }
+        for (String each : tableNameList) {
+            result.put(each, tableMetaDataLoader.load(each, shardingRule));
         }
+
         return result;
     }
 
