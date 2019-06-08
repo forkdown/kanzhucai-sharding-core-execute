@@ -50,7 +50,7 @@ public final class TableMetaDataInitializer {
     //before function integrated into base project,
     //you can rebuild org.apache.shardingsphere.core.execute module,
     //change this to true ,then "mvn clean install" to use this function in your local environment.
-    private boolean startUpBoostedMode = false;
+    private boolean startUpBoostedMode = true;
 
     public TableMetaDataInitializer(final ShardingDataSourceMetaData shardingDataSourceMetaData, final ShardingExecuteEngine executeEngine,
                                     final TableMetaDataConnectionManager connectionManager, final int maxConnectionsSizePerQuery, final boolean isCheckingMetaData) {
